@@ -3,8 +3,12 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <math.h>
+#include <string.h>
 #include "time.h"
 
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <esp_display_panel.hpp>
 #include <esp_err.h>
 #include <lvgl.h>
@@ -77,11 +81,11 @@ lv_obj_t *lbl_t3;
 lv_obj_t *lbl_text_desc3;
 lv_obj_t *img_m3;
 
-lv_obj_t *ta_city;        
-lv_obj_t *ta_wifi_ssid;   
-lv_obj_t *ta_wifi_pass;   
-lv_obj_t *keyboard;       
-lv_obj_t *lbl_status_msg; 
+lv_obj_t *ta_city;
+lv_obj_t *ta_wifi_ssid;
+lv_obj_t *ta_wifi_pass;
+lv_obj_t *keyboard;
+lv_obj_t *lbl_status_msg;
 
 int last_min = -1;
 
@@ -93,7 +97,7 @@ struct WeatherData {
     bool valid = false;
     float current_temp = 0.0f;
     int current_humidity = 0;
-    
+
     float max1 = 0.0f;
     float min1 = 0.0f;
     int code1 = 0;
@@ -107,7 +111,53 @@ struct WeatherData {
     int code3 = 0;
 };
 
+enum AppRequestType : uint8_t {
+    APP_REQUEST_FETCH_WEATHER = 0,
+    APP_REQUEST_UPDATE_CITY,
+    APP_REQUEST_UPDATE_WIFI,
+};
+
+struct AppRequest {
+    AppRequestType type;
+    char city[64];
+    char ssid[64];
+    char pass[64];
+};
+
+struct StatusState {
+    char text[96];
+    uint32_t color_hex;
+};
+
 WeatherData cached_weather;
+WeatherData displayed_weather;
+bool displayed_weather_valid = false;
+String displayed_city;
+String displayed_status_text;
+uint32_t displayed_status_color = 0;
+
+SemaphoreHandle_t app_state_mutex = nullptr;
+QueueHandle_t app_request_queue = nullptr;
+
+StatusState pending_status = { "", 0x888888 };
+bool pending_status_dirty = false;
+bool pending_ui_sync = false;
+
+constexpr uint32_t APP_REQUEST_QUEUE_LEN = 6;
+constexpr uint8_t WEATHER_DOWNLOAD_MAX_RETRIES = 3;
+constexpr uint32_t WEATHER_RETRY_DELAY_MS = 1500;
+
+void apply_state_to_ui_task(void *user_data);
+bool enqueue_app_request(const AppRequest &request);
+bool weather_data_equals(const WeatherData &lhs, const WeatherData &rhs);
+void update_weather_display(const WeatherData &weather, const String &city_name);
+void update_status_message(const char *text, uint32_t color_hex);
+void schedule_ui_sync();
+void load_saved_settings();
+void store_status_message(const char *text, uint32_t color_hex);
+void handle_weather_refresh();
+bool update_coordinates_by_city(const String &city_name_input, float &resolved_lat, float &resolved_lon, String &resolved_city);
+bool apply_and_connect_wifi(String ssid, String pass);
 
 // --------------------------------------------------
 // CONVERSIONE CODICE WMO -> ICONA & DESCRIZIONE
@@ -115,13 +165,13 @@ WeatherData cached_weather;
 
 const void* get_weather_icon(int wmo_code)
 {
-    if (wmo_code == 0) return &sun;                              
-    if (wmo_code >= 1 && wmo_code <= 2) return &sun_cloud;       
-    if (wmo_code >= 3 && wmo_code <= 48) return &cloud;          
-    if ((wmo_code >= 51 && wmo_code <= 67) || (wmo_code >= 80 && wmo_code <= 82)) return &rain; 
-    if (wmo_code >= 71 && wmo_code <= 77) return &snow;          
-    if (wmo_code >= 95) return &storm;                         
-    return &sun_cloud; 
+    if (wmo_code == 0) return &sun;
+    if (wmo_code >= 1 && wmo_code <= 2) return &sun_cloud;
+    if (wmo_code >= 3 && wmo_code <= 48) return &cloud;
+    if ((wmo_code >= 51 && wmo_code <= 67) || (wmo_code >= 80 && wmo_code <= 82)) return &rain;
+    if (wmo_code >= 71 && wmo_code <= 77) return &snow;
+    if (wmo_code >= 95) return &storm;
+    return &sun_cloud;
 }
 
 const char* get_weather_description(int wmo_code)
@@ -131,17 +181,17 @@ const char* get_weather_description(int wmo_code)
         case 1:  return "Poco nuvoloso";
         case 2:  return "Parz. nuvoloso";
         case 3:  return "Nuvoloso";
-        case 45: 
+        case 45:
         case 48: return "Nebbia / Brina";
         case 51: return "Pioviggine leggera";
         case 53: return "Pioviggine";
         case 55: return "Pioviggine densa";
-        case 56: 
+        case 56:
         case 57: return "Pioviggine gelata";
         case 61: return "Pioggia debole";
         case 63: return "Pioggia moderata";
         case 65: return "Pioggia forte";
-        case 66: 
+        case 66:
         case 67: return "Pioggia gelata";
         case 71: return "Neve debole";
         case 73: return "Neve moderata";
@@ -150,12 +200,64 @@ const char* get_weather_description(int wmo_code)
         case 80: return "Rovesci di pioggia";
         case 81: return "Rovesci moderati";
         case 82: return "Rovesci violenti";
-        case 85: 
+        case 85:
         case 86: return "Rovesci di neve";
         case 95: return "Temporale";
-        case 96: 
+        case 96:
         case 99: return "Temporale con grandine";
         default: return "Variabile";
+    }
+}
+
+bool weather_data_equals(const WeatherData &lhs, const WeatherData &rhs)
+{
+    return lhs.valid == rhs.valid &&
+           fabsf(lhs.current_temp - rhs.current_temp) < 0.05f &&
+           lhs.current_humidity == rhs.current_humidity &&
+           fabsf(lhs.max1 - rhs.max1) < 0.05f &&
+           fabsf(lhs.min1 - rhs.min1) < 0.05f &&
+           lhs.code1 == rhs.code1 &&
+           fabsf(lhs.max2 - rhs.max2) < 0.05f &&
+           fabsf(lhs.min2 - rhs.min2) < 0.05f &&
+           lhs.code2 == rhs.code2 &&
+           fabsf(lhs.max3 - rhs.max3) < 0.05f &&
+           fabsf(lhs.min3 - rhs.min3) < 0.05f &&
+           lhs.code3 == rhs.code3;
+}
+
+void set_label_text_if_changed(lv_obj_t *label, const char *text)
+{
+    if ((label == nullptr) || (text == nullptr)) {
+        return;
+    }
+
+    const char *current_text = lv_label_get_text(label);
+    if ((current_text == nullptr) || (strcmp(current_text, text) != 0)) {
+        lv_label_set_text(label, text);
+    }
+}
+
+void set_img_src_if_changed(lv_obj_t *image, const void *src)
+{
+    if ((image != nullptr) && (lv_img_get_src(image) != src)) {
+        lv_img_set_src(image, src);
+    }
+}
+
+void update_status_message(const char *text, uint32_t color_hex)
+{
+    if ((lbl_status_msg == nullptr) || (text == nullptr)) {
+        return;
+    }
+
+    if (displayed_status_text != text) {
+        lv_label_set_text(lbl_status_msg, text);
+        displayed_status_text = text;
+    }
+
+    if (displayed_status_color != color_hex) {
+        lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(color_hex), 0);
+        displayed_status_color = color_hex;
     }
 }
 
@@ -166,117 +268,299 @@ const char* get_weather_description(int wmo_code)
 bool download_weather_data(WeatherData &weather)
 {
     if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Meteo: Wi-Fi non connesso, download saltato.");
         return false;
+    }
+
+    float local_lat = lat;
+    float local_lon = lon;
+    if (app_state_mutex != nullptr) {
+        xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+        local_lat = lat;
+        local_lon = lon;
+        xSemaphoreGive(app_state_mutex);
     }
 
     String url =
         "https://api.open-meteo.com/v1/forecast"
-        "?latitude=" + String(lat, 4) +
-        "&longitude=" + String(lon, 4) +
+        "?latitude=" + String(local_lat, 4) +
+        "&longitude=" + String(local_lon, 4) +
         "&current=temperature_2m,relative_humidity_2m"
         "&daily=weather_code,temperature_2m_max,temperature_2m_min"
         "&timezone=auto";
 
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    http.setTimeout(15000);
+    for (uint8_t attempt = 1; attempt <= WEATHER_DOWNLOAD_MAX_RETRIES; ++attempt) {
+        HTTPClient http;
+        http.setConnectTimeout(10000);
+        http.setTimeout(15000);
 
-    if (!http.begin(url)) return false;
+        if (!http.begin(url)) {
+            Serial.printf("Meteo: avvio HTTP fallito (%u/%u)\n", attempt, WEATHER_DOWNLOAD_MAX_RETRIES);
+        } else {
+            int httpResponseCode = http.GET();
+            if (httpResponseCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                http.end();
 
-    int httpResponseCode = http.GET();
-    if (httpResponseCode != HTTP_CODE_OK) {
-        http.end();
-        return false;
+                DynamicJsonDocument doc(8192);
+                DeserializationError error = deserializeJson(doc, payload);
+                if (error) {
+                    Serial.printf("Meteo: JSON non valido (%u/%u)\n", attempt, WEATHER_DOWNLOAD_MAX_RETRIES);
+                } else {
+                    JsonVariant currentTemp = doc["current"]["temperature_2m"];
+                    JsonVariant currentHumidity = doc["current"]["relative_humidity_2m"];
+                    JsonArray weatherCodes = doc["daily"]["weather_code"];
+                    JsonArray maxTemps = doc["daily"]["temperature_2m_max"];
+                    JsonArray minTemps = doc["daily"]["temperature_2m_min"];
+
+                    if (currentTemp.isNull() || currentHumidity.isNull() || weatherCodes.isNull() ||
+                        maxTemps.isNull() || minTemps.isNull() ||
+                        (weatherCodes.size() < 3) || (maxTemps.size() < 3) || (minTemps.size() < 3)) {
+                        Serial.printf("Meteo: dati incompleti ricevuti (%u/%u)\n", attempt, WEATHER_DOWNLOAD_MAX_RETRIES);
+                    } else {
+                        weather.current_temp = currentTemp.as<float>();
+                        weather.current_humidity = currentHumidity.as<int>();
+
+                        weather.max1 = maxTemps[0].as<float>();
+                        weather.min1 = minTemps[0].as<float>();
+                        weather.code1 = weatherCodes[0].as<int>();
+
+                        weather.max2 = maxTemps[1].as<float>();
+                        weather.min2 = minTemps[1].as<float>();
+                        weather.code2 = weatherCodes[1].as<int>();
+
+                        weather.max3 = maxTemps[2].as<float>();
+                        weather.min3 = minTemps[2].as<float>();
+                        weather.code3 = weatherCodes[2].as<int>();
+
+                        weather.valid = true;
+                        return true;
+                    }
+                }
+            } else {
+                Serial.printf("Meteo: HTTP %d (%u/%u)\n", httpResponseCode, attempt, WEATHER_DOWNLOAD_MAX_RETRIES);
+            }
+
+            http.end();
+        }
+
+        if (attempt < WEATHER_DOWNLOAD_MAX_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(WEATHER_RETRY_DELAY_MS));
+        }
     }
 
-    String payload = http.getString();
-    http.end();
-
-    DynamicJsonDocument doc(8192);
-    DeserializationError error = deserializeJson(doc, payload);
-    if (error) return false;
-
-    JsonVariant currentTemp = doc["current"]["temperature_2m"];
-    JsonVariant currentHumidity = doc["current"]["relative_humidity_2m"];
-    JsonArray weatherCodes = doc["daily"]["weather_code"];
-    JsonArray maxTemps = doc["daily"]["temperature_2m_max"];
-    JsonArray minTemps = doc["daily"]["temperature_2m_min"];
-
-    if (currentTemp.isNull() || currentHumidity.isNull() || weatherCodes.isNull() || maxTemps.isNull() || minTemps.isNull()) {
-        return false;
-    }
-
-    weather.current_temp = currentTemp.as<float>();
-    weather.current_humidity = currentHumidity.as<int>();
-
-    weather.max1 = maxTemps[0].as<float>();
-    weather.min1 = minTemps[0].as<float>();
-    weather.code1 = weatherCodes[0].as<int>();
-
-    weather.max2 = maxTemps[1].as<float>();
-    weather.min2 = minTemps[1].as<float>();
-    weather.code2 = weatherCodes[1].as<int>();
-
-    weather.max3 = maxTemps[2].as<float>();
-    weather.min3 = minTemps[2].as<float>();
-    weather.code3 = weatherCodes[2].as<int>();
-
-    weather.valid = true;
-    return true;
+    return false;
 }
 
 // --------------------------------------------------
 // AGGIORNAMENTO DISPLAY METEO PULITO
 // --------------------------------------------------
 
-void update_weather_display(const WeatherData &weather)
+void update_weather_display(const WeatherData &weather, const String &city_name)
 {
     if (!weather.valid) return;
+
+    if (displayed_weather_valid && weather_data_equals(displayed_weather, weather) && (displayed_city == city_name)) {
+        return;
+    }
 
     char buffer[64];
 
     snprintf(buffer, sizeof(buffer), "%.1f°C / %.1f°C", weather.max1, weather.min1);
-    if (lbl_t1 != nullptr) lv_label_set_text(lbl_t1, buffer);
+    set_label_text_if_changed(lbl_t1, buffer);
 
     snprintf(buffer, sizeof(buffer), "Attuale: %.1f°C\nUmidità: %d%%", weather.current_temp, weather.current_humidity);
-    if (lbl_desc1 != nullptr) lv_label_set_text(lbl_desc1, buffer);
+    set_label_text_if_changed(lbl_desc1, buffer);
 
-    if (lbl_text_desc1 != nullptr) lv_label_set_text(lbl_text_desc1, get_weather_description(weather.code1));
-    if (img_m1 != nullptr) lv_img_set_src(img_m1, get_weather_icon(weather.code1));
+    set_label_text_if_changed(lbl_text_desc1, get_weather_description(weather.code1));
+    set_img_src_if_changed(img_m1, get_weather_icon(weather.code1));
 
     snprintf(buffer, sizeof(buffer), "%.1f°C / %.1f°C", weather.max2, weather.min2);
-    if (lbl_t2 != nullptr) lv_label_set_text(lbl_t2, buffer);
-    if (lbl_text_desc2 != nullptr) lv_label_set_text(lbl_text_desc2, get_weather_description(weather.code2));
-    if (img_m2 != nullptr) lv_img_set_src(img_m2, get_weather_icon(weather.code2));
+    set_label_text_if_changed(lbl_t2, buffer);
+    set_label_text_if_changed(lbl_text_desc2, get_weather_description(weather.code2));
+    set_img_src_if_changed(img_m2, get_weather_icon(weather.code2));
 
     snprintf(buffer, sizeof(buffer), "%.1f°C / %.1f°C", weather.max3, weather.min3);
-    if (lbl_t3 != nullptr) lv_label_set_text(lbl_t3, buffer);
-    if (lbl_text_desc3 != nullptr) lv_label_set_text(lbl_text_desc3, get_weather_description(weather.code3));
-    if (img_m3 != nullptr) lv_img_set_src(img_m3, get_weather_icon(weather.code3));
+    set_label_text_if_changed(lbl_t3, buffer);
+    set_label_text_if_changed(lbl_text_desc3, get_weather_description(weather.code3));
+    set_img_src_if_changed(img_m3, get_weather_icon(weather.code3));
 
-    if (lbl_loc_d1 != nullptr) lv_label_set_text(lbl_loc_d1, current_city.c_str());
+    set_label_text_if_changed(lbl_loc_d1, city_name.c_str());
+
+    displayed_weather = weather;
+    displayed_weather_valid = true;
+    displayed_city = city_name;
 }
 
-void fetch_weather_data()
+void schedule_ui_sync()
 {
-    WeatherData new_weather;
-    if (download_weather_data(new_weather)) {
-        cached_weather = new_weather;
+    if (app_state_mutex == nullptr) {
+        return;
+    }
 
-        if (esp_lv_adapter_lock(50) == ESP_OK) {
-            update_weather_display(cached_weather);
-            esp_lv_adapter_unlock();
+    bool should_post = false;
+    xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+    if (!pending_ui_sync) {
+        pending_ui_sync = true;
+        should_post = true;
+    }
+    xSemaphoreGive(app_state_mutex);
+
+    if (should_post) {
+        esp_err_t err = esp_lv_adapter_post_task(apply_state_to_ui_task, nullptr, 10);
+        if (err != ESP_OK) {
+            xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+            pending_ui_sync = false;
+            xSemaphoreGive(app_state_mutex);
+            Serial.printf("UI: invio aggiornamento LVGL fallito (%d)\n", err);
         }
+    }
+}
+
+void apply_state_to_ui_task(void *user_data)
+{
+    LV_UNUSED(user_data);
+
+    WeatherData weather_copy = {};
+    String city_copy;
+    StatusState status_copy = { "", 0x888888 };
+    bool has_weather = false;
+    bool has_status = false;
+
+    if (app_state_mutex != nullptr) {
+        xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+        weather_copy = cached_weather;
+        city_copy = current_city;
+        status_copy = pending_status;
+        has_weather = cached_weather.valid;
+        has_status = pending_status_dirty;
+        pending_status_dirty = false;
+        pending_ui_sync = false;
+        xSemaphoreGive(app_state_mutex);
+    }
+
+    if ((city_copy.length() > 0) && (displayed_city != city_copy)) {
+        set_label_text_if_changed(lbl_loc_d1, city_copy.c_str());
+        displayed_city = city_copy;
+        if ((ta_city != nullptr) && (strcmp(lv_textarea_get_text(ta_city), city_copy.c_str()) != 0)) {
+            lv_textarea_set_text(ta_city, city_copy.c_str());
+        }
+    }
+
+    if (has_weather) {
+        update_weather_display(weather_copy, city_copy);
+    }
+
+    if (has_status) {
+        update_status_message(status_copy.text, status_copy.color_hex);
+    }
+}
+
+void store_status_message(const char *text, uint32_t color_hex)
+{
+    if ((app_state_mutex == nullptr) || (text == nullptr)) {
+        return;
+    }
+
+    xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+    strlcpy(pending_status.text, text, sizeof(pending_status.text));
+    pending_status.color_hex = color_hex;
+    pending_status_dirty = true;
+    xSemaphoreGive(app_state_mutex);
+    schedule_ui_sync();
+}
+
+void handle_weather_refresh()
+{
+    WeatherData new_weather = {};
+    if (!download_weather_data(new_weather)) {
+        Serial.println("Meteo: aggiornamento non riuscito.");
+        return;
+    }
+
+    bool weather_changed = false;
+    xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+    weather_changed = !weather_data_equals(cached_weather, new_weather);
+    if (weather_changed) {
+        cached_weather = new_weather;
+    }
+    xSemaphoreGive(app_state_mutex);
+
+    if (weather_changed) {
+        schedule_ui_sync();
+    } else {
+        Serial.println("Meteo: nessuna variazione, refresh UI saltato.");
     }
 }
 
 void weather_task(void *parameter)
 {
-    fetch_weather_data();
+    LV_UNUSED(parameter);
+
+    handle_weather_refresh();
 
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(WEATHER_UPDATE_INTERVAL_MS));
-        fetch_weather_data();
+        AppRequest request = {};
+        if (xQueueReceive(app_request_queue, &request, pdMS_TO_TICKS(WEATHER_UPDATE_INTERVAL_MS)) != pdTRUE) {
+            handle_weather_refresh();
+            continue;
+        }
+
+        if (request.type == APP_REQUEST_FETCH_WEATHER) {
+            handle_weather_refresh();
+            continue;
+        }
+
+        if (request.type == APP_REQUEST_UPDATE_CITY) {
+            String city_name = String(request.city);
+            float new_lat = lat;
+            float new_lon = lon;
+            String resolved_city;
+
+            if (update_coordinates_by_city(city_name, new_lat, new_lon, resolved_city)) {
+                xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+                current_city = resolved_city;
+                lat = new_lat;
+                lon = new_lon;
+                xSemaphoreGive(app_state_mutex);
+
+                preferences.begin("camper-cfg", false);
+                preferences.putString("city", current_city);
+                preferences.putFloat("lat", lat);
+                preferences.putFloat("lon", lon);
+                preferences.end();
+
+                char status_buf[96];
+                snprintf(status_buf, sizeof(status_buf), "Meteo aggiornato: %s", current_city.c_str());
+                store_status_message(status_buf, 0x00ffcc);
+                handle_weather_refresh();
+            } else {
+                store_status_message("Errore: Località non trovata!", 0xff5555);
+            }
+            continue;
+        }
+
+        if (request.type == APP_REQUEST_UPDATE_WIFI) {
+            String ssid = String(request.ssid);
+            String pass = String(request.pass);
+
+            xSemaphoreTake(app_state_mutex, portMAX_DELAY);
+            current_ssid = ssid;
+            current_pass = pass;
+            xSemaphoreGive(app_state_mutex);
+
+            preferences.begin("camper-cfg", false);
+            preferences.putString("ssid", current_ssid);
+            preferences.putString("pass", current_pass);
+            preferences.end();
+
+            if (apply_and_connect_wifi(current_ssid, current_pass)) {
+                store_status_message("Wi-Fi connesso con successo!", 0x00ffcc);
+                handle_weather_refresh();
+            } else {
+                store_status_message("Errore: Connessione Wi-Fi fallita!", 0xff5555);
+            }
+        }
     }
 }
 
@@ -284,13 +568,14 @@ void weather_task(void *parameter)
 // GEOCODIFICA DINAMICA
 // --------------------------------------------------
 
-bool update_coordinates_by_city(String city_name)
+bool update_coordinates_by_city(const String &city_name_input, float &resolved_lat, float &resolved_lon, String &resolved_city)
 {
     if (WiFi.status() != WL_CONNECTED) return false;
 
+    String city_name = city_name_input;
     city_name.replace(" ", "%20");
     String url = "https://geocoding-api.open-meteo.com/v1/search?name=" + city_name + "&count=1&language=it&format=json";
-    
+
     HTTPClient http;
     http.setConnectTimeout(10000);
     http.setTimeout(15000);
@@ -313,12 +598,14 @@ bool update_coordinates_by_city(String city_name)
     JsonArray results = doc["results"];
     if (results.isNull() || results.size() == 0) return false;
 
-    lat = results[0]["latitude"].as<float>();
-    lon = results[0]["longitude"].as<float>();
-    
+    resolved_lat = results[0]["latitude"].as<float>();
+    resolved_lon = results[0]["longitude"].as<float>();
+
     String official_name = results[0]["name"].as<String>();
     if (official_name.length() > 0) {
-        current_city = official_name;
+        resolved_city = official_name;
+    } else {
+        resolved_city = city_name_input;
     }
 
     return true;
@@ -332,6 +619,7 @@ bool apply_and_connect_wifi(String ssid, String pass)
 {
     WiFi.disconnect(true);
     delay(500);
+    Serial.println("Wi-Fi: avvio connessione...");
     WiFi.begin(ssid.c_str(), pass.c_str());
 
     unsigned long startAttemptTime = millis();
@@ -344,6 +632,31 @@ bool apply_and_connect_wifi(String ssid, String pass)
         return true;
     }
     return false;
+}
+
+bool enqueue_app_request(const AppRequest &request)
+{
+    if (app_request_queue == nullptr) {
+        return false;
+    }
+
+    if (xQueueSend(app_request_queue, &request, pdMS_TO_TICKS(10)) != pdTRUE) {
+        Serial.println("Task rete: coda richieste piena.");
+        return false;
+    }
+
+    return true;
+}
+
+void load_saved_settings()
+{
+    preferences.begin("camper-cfg", true);
+    current_city = preferences.getString("city", current_city);
+    lat = preferences.getFloat("lat", lat);
+    lon = preferences.getFloat("lon", lon);
+    current_ssid = preferences.getString("ssid", current_ssid);
+    current_pass = preferences.getString("pass", current_pass);
+    preferences.end();
 }
 
 // --------------------------------------------------
@@ -365,59 +678,24 @@ static void ta_event_cb(lv_event_t *e)
         String input_val = String(lv_textarea_get_text(ta));
 
         if (ta == ta_city) {
-            if (lbl_status_msg != nullptr) {
-                lv_label_set_text(lbl_status_msg, "Ricerca località online...");
-                lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(0xffaa00), 0);
-            }
+            update_status_message("Ricerca località online...", 0xffaa00);
 
-            if (update_coordinates_by_city(input_val)) {
-                preferences.begin("camper-cfg", false);
-                preferences.putString("city", current_city);
-                preferences.putFloat("lat", lat);
-                preferences.putFloat("lon", lon);
-                preferences.end();
-                
-                lv_textarea_set_text(ta, current_city.c_str());
-
-                if (lbl_status_msg != nullptr) {
-                    char status_buf[96];
-                    snprintf(status_buf, sizeof(status_buf), "Meteo aggiornato: %s", current_city.c_str());
-                    lv_label_set_text(lbl_status_msg, status_buf);
-                    lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(0x00ffcc), 0);
-                }
-                fetch_weather_data();
-            } else {
-                if (lbl_status_msg != nullptr) {
-                    lv_label_set_text(lbl_status_msg, "Errore: Località non trovata!");
-                    lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(0xff5555), 0);
-                }
+            AppRequest request = {};
+            request.type = APP_REQUEST_UPDATE_CITY;
+            strlcpy(request.city, input_val.c_str(), sizeof(request.city));
+            if (!enqueue_app_request(request)) {
+                update_status_message("Errore: richiesta località non accodata!", 0xff5555);
             }
         }
         else if (ta == ta_wifi_ssid || ta == ta_wifi_pass) {
-            current_ssid = String(lv_textarea_get_text(ta_wifi_ssid));
-            current_pass = String(lv_textarea_get_text(ta_wifi_pass));
+            update_status_message("Connessione al nuovo Wi-Fi in corso...", 0xffaa00);
 
-            preferences.begin("camper-cfg", false);
-            preferences.putString("ssid", current_ssid);
-            preferences.putString("pass", current_pass);
-            preferences.end();
-
-            if (lbl_status_msg != nullptr) {
-                lv_label_set_text(lbl_status_msg, "Connessione al nuovo Wi-Fi in corso...");
-                lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(0xffaa00), 0);
-            }
-
-            if (apply_and_connect_wifi(current_ssid, current_pass)) {
-                if (lbl_status_msg != nullptr) {
-                    lv_label_set_text(lbl_status_msg, "Wi-Fi connesso con successo!");
-                    lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(0x00ffcc), 0);
-                }
-                fetch_weather_data();
-            } else {
-                if (lbl_status_msg != nullptr) {
-                    lv_label_set_text(lbl_status_msg, "Errore: Connessione Wi-Fi fallita!");
-                    lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(0xff5555), 0);
-                }
+            AppRequest request = {};
+            request.type = APP_REQUEST_UPDATE_WIFI;
+            strlcpy(request.ssid, lv_textarea_get_text(ta_wifi_ssid), sizeof(request.ssid));
+            strlcpy(request.pass, lv_textarea_get_text(ta_wifi_pass), sizeof(request.pass));
+            if (!enqueue_app_request(request)) {
+                update_status_message("Errore: richiesta Wi-Fi non accodata!", 0xff5555);
             }
         }
 
@@ -443,6 +721,7 @@ static void keyboard_event_cb(lv_event_t *e)
 // --------------------------------------------------
 static void system_timer_cb(lv_timer_t *timer)
 {
+    LV_UNUSED(timer);
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) return;
 
@@ -453,10 +732,8 @@ static void system_timer_cb(lv_timer_t *timer)
 
     char buffer[16];
     snprintf(buffer, sizeof(buffer), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
-    
-    if (lbl_clock != nullptr) {
-        lv_label_set_text(lbl_clock, buffer);
-    }
+
+    set_label_text_if_changed(lbl_clock, buffer);
 }
 
 static void sidebar_event_cb(lv_event_t *event)
@@ -470,13 +747,6 @@ static void sidebar_event_cb(lv_event_t *event)
     lv_obj_add_flag(tab_settings, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_clear_flag(target_tab, LV_OBJ_FLAG_HIDDEN);
-
-    if (target_tab == tab_meteo && cached_weather.valid) {
-        if (esp_lv_adapter_lock(20) == ESP_OK) {
-            update_weather_display(cached_weather);
-            esp_lv_adapter_unlock();
-        }
-    }
 }
 
 // --------------------------------------------------
@@ -525,14 +795,6 @@ void create_camper_ui()
 {
     lv_obj_t *screen = lv_scr_act();
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x1a1a1a), 0);
-
-    preferences.begin("camper-cfg", true);
-    current_city = preferences.getString("city", "Chiavari");
-    lat = preferences.getFloat("lat", 44.3167);
-    lon = preferences.getFloat("lon", 9.3333);
-    current_ssid = preferences.getString("ssid", "Vodafone-A72270520");
-    current_pass = preferences.getString("pass", "aex624dms24ca83k");
-    preferences.end();
 
     lv_obj_t *sidebar = lv_obj_create(screen);
     lv_obj_set_size(sidebar, 100, 480);
@@ -662,6 +924,8 @@ void create_camper_ui()
     lv_obj_set_style_text_color(lbl_status_msg, lv_color_hex(0x888888), 0);
     lv_obj_set_style_text_font(lbl_status_msg, &lv_font_montserrat_14, 0);
     lv_obj_align(lbl_status_msg, LV_ALIGN_TOP_LEFT, 20, 130);
+    displayed_status_text = "Stato: Pronto. Tocca un campo per modificare.";
+    displayed_status_color = 0x888888;
 
     keyboard = lv_keyboard_create(tab_settings);
     lv_obj_set_size(keyboard, 660, 190);
@@ -704,19 +968,26 @@ void setup()
     Serial.begin(115200);
     Serial.println("Avvio Dashboard Camper...");
 
+    load_saved_settings();
+
     WiFi.begin(current_ssid.c_str(), current_pass.c_str());
     unsigned long startAttemptTime = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
         delay(500);
         Serial.print(".");
     }
-    
+
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println("\nWi-Fi connesso con successo!");
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     } else {
         Serial.println("\nConnessione Wi-Fi fallita.");
     }
+
+    app_state_mutex = xSemaphoreCreateMutex();
+    app_request_queue = xQueueCreate(APP_REQUEST_QUEUE_LEN, sizeof(AppRequest));
+    assert(app_state_mutex != nullptr);
+    assert(app_request_queue != nullptr);
 
     Board *board = new Board();
     if ((board == nullptr) || !board->init()) {
@@ -739,7 +1010,7 @@ void setup()
     esp_lv_adapter_config_t adapter_config = ESP_LV_ADAPTER_DEFAULT_CONFIG();
     adapter_config.task_stack_size = 12 * 1024;
     adapter_config.task_priority = 3;
-    adapter_config.task_core_id = 1; 
+    adapter_config.task_core_id = 1;
     ESP_ERROR_CHECK(esp_lv_adapter_init(&adapter_config));
 
     esp_lv_adapter_display_config_t disp_config = ESP_LV_ADAPTER_DISPLAY_RGB_DEFAULT_CONFIG(
@@ -763,8 +1034,9 @@ void setup()
     esp_lv_adapter_unlock();
 
     xTaskCreatePinnedToCore(weather_task, "weather_task", 4096, nullptr, 2, nullptr, 0);
-
-    fetch_weather_data();
+    AppRequest initial_request = {};
+    initial_request.type = APP_REQUEST_FETCH_WEATHER;
+    enqueue_app_request(initial_request);
 
     Serial.println("Dashboard avviata!");
 }

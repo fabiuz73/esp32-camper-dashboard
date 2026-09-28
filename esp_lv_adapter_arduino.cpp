@@ -15,8 +15,11 @@ typedef struct {
     bool initialized;
     bool started;
     bool rgb_full_refresh;
+    bool rgb_flush_pending;
+    int64_t rgb_flush_deadline_us;
     esp_lv_adapter_config_t config;
     SemaphoreHandle_t lvgl_mux;
+    QueueHandle_t task_queue;
     TaskHandle_t lvgl_task_handle;
     esp_timer_handle_t lvgl_tick_timer;
     LCD *lcd;
@@ -32,6 +35,15 @@ typedef struct {
 } esp_lv_adapter_arduino_context_t;
 
 static esp_lv_adapter_arduino_context_t s_ctx = {};
+static constexpr uint32_t LVGL_TASK_QUEUE_LEN = 8;
+static constexpr uint32_t RGB_FLUSH_TIMEOUT_MS = 250;
+static constexpr uint32_t WORKER_NOTIFY_FLUSH_READY = (1U << 0);
+static constexpr uint32_t WORKER_NOTIFY_TASK_POSTED = (1U << 1);
+
+typedef struct {
+    esp_lv_adapter_task_cb_t cb;
+    void *user_data;
+} esp_lv_adapter_task_item_t;
 
 static void lvgl_tick_cb(void *arg)
 {
@@ -44,8 +56,31 @@ static void lvgl_worker(void *arg)
     LV_UNUSED(arg);
 
     uint32_t delay_ms = s_ctx.config.task_max_delay_ms;
+    uint32_t pending_notifications = 0;
     while (true) {
+        uint32_t notifications = pending_notifications;
+        pending_notifications = 0;
+        xTaskNotifyWait(0, ULONG_MAX, &pending_notifications, 0);
+        notifications |= pending_notifications;
+        pending_notifications = 0;
+
         if (esp_lv_adapter_lock(-1) == ESP_OK) {
+            if ((notifications & WORKER_NOTIFY_FLUSH_READY) && s_ctx.rgb_flush_pending) {
+                s_ctx.rgb_flush_pending = false;
+                lv_disp_flush_ready(&s_ctx.disp_drv);
+            } else if (s_ctx.rgb_flush_pending && (esp_timer_get_time() >= s_ctx.rgb_flush_deadline_us)) {
+                s_ctx.rgb_flush_pending = false;
+                Serial.println("LVGL: timeout refresh RGB, flush completato forzatamente.");
+                lv_disp_flush_ready(&s_ctx.disp_drv);
+            }
+
+            esp_lv_adapter_task_item_t task_item = {};
+            while ((s_ctx.task_queue != nullptr) && (xQueueReceive(s_ctx.task_queue, &task_item, 0) == pdTRUE)) {
+                if (task_item.cb != nullptr) {
+                    task_item.cb(task_item.user_data);
+                }
+            }
+
             delay_ms = lv_timer_handler();
             esp_lv_adapter_unlock();
         }
@@ -56,7 +91,7 @@ static void lvgl_worker(void *arg)
             delay_ms = s_ctx.config.task_max_delay_ms;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        xTaskNotifyWait(0, ULONG_MAX, &pending_notifications, pdMS_TO_TICKS(delay_ms));
     }
 }
 
@@ -64,7 +99,7 @@ IRAM_ATTR static bool rgb_refresh_finish_cb(void *user_data)
 {
     BaseType_t need_yield = pdFALSE;
     TaskHandle_t task_handle = static_cast<TaskHandle_t>(user_data);
-    xTaskNotifyFromISR(task_handle, ULONG_MAX, eNoAction, &need_yield);
+    xTaskNotifyFromISR(task_handle, WORKER_NOTIFY_FLUSH_READY, eSetBits, &need_yield);
     return (need_yield == pdTRUE);
 }
 
@@ -85,9 +120,10 @@ static void flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t 
 
     if (s_ctx.rgb_full_refresh) {
         if (lv_disp_flush_is_last(disp_drv)) {
+            s_ctx.rgb_flush_pending = true;
+            s_ctx.rgb_flush_deadline_us = esp_timer_get_time() + (RGB_FLUSH_TIMEOUT_MS * 1000LL);
             lcd->switchFrameBufferTo(color_map);
-            ulTaskNotifyValueClear(nullptr, ULONG_MAX);
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            return;
         }
         lv_disp_flush_ready(disp_drv);
         return;
@@ -143,6 +179,13 @@ esp_err_t esp_lv_adapter_init(const esp_lv_adapter_config_t *config)
         return ESP_ERR_NO_MEM;
     }
 
+    s_ctx.task_queue = xQueueCreate(LVGL_TASK_QUEUE_LEN, sizeof(esp_lv_adapter_task_item_t));
+    if (s_ctx.task_queue == nullptr) {
+        vSemaphoreDelete(s_ctx.lvgl_mux);
+        s_ctx.lvgl_mux = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+
     lv_init();
 
     const esp_timer_create_args_t tick_args = {
@@ -153,6 +196,29 @@ esp_err_t esp_lv_adapter_init(const esp_lv_adapter_config_t *config)
     ESP_ERROR_CHECK(esp_timer_start_periodic(s_ctx.lvgl_tick_timer, s_ctx.config.tick_period_ms * 1000));
 
     s_ctx.initialized = true;
+    return ESP_OK;
+}
+
+esp_err_t esp_lv_adapter_post_task(esp_lv_adapter_task_cb_t cb, void *user_data, int32_t timeout_ms)
+{
+    if ((s_ctx.task_queue == nullptr) || (cb == nullptr)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_lv_adapter_task_item_t task_item = {
+        .cb = cb,
+        .user_data = user_data,
+    };
+
+    TickType_t timeout_ticks = (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    if (xQueueSend(s_ctx.task_queue, &task_item, timeout_ticks) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_ctx.lvgl_task_handle != nullptr) {
+        xTaskNotify(s_ctx.lvgl_task_handle, WORKER_NOTIFY_TASK_POSTED, eSetBits);
+    }
+
     return ESP_OK;
 }
 
@@ -331,6 +397,11 @@ esp_err_t esp_lv_adapter_deinit(void)
     if (s_ctx.lvgl_mux != nullptr) {
         vSemaphoreDelete(s_ctx.lvgl_mux);
         s_ctx.lvgl_mux = nullptr;
+    }
+
+    if (s_ctx.task_queue != nullptr) {
+        vQueueDelete(s_ctx.task_queue);
+        s_ctx.task_queue = nullptr;
     }
 
     memset(&s_ctx, 0, sizeof(s_ctx));
