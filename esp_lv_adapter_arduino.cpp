@@ -4,6 +4,7 @@
 #include <limits.h>
 
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -85,9 +86,12 @@ static void flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t 
 
     if (s_ctx.rgb_full_refresh) {
         if (lv_disp_flush_is_last(disp_drv)) {
+            ulTaskNotifyValueClear(s_ctx.lvgl_task_handle, ULONG_MAX);
             lcd->switchFrameBufferTo(color_map);
-            ulTaskNotifyValueClear(nullptr, ULONG_MAX);
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            const uint32_t wait_timeout_ms = 200;
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_timeout_ms)) == 0) {
+                ESP_LOGW("esp_lv_adapter", "RGB refresh wait timeout (%lu ms)", static_cast<unsigned long>(wait_timeout_ms));
+            }
         }
         lv_disp_flush_ready(disp_drv);
         return;
