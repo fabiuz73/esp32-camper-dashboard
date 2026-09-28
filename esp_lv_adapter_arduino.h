@@ -6,6 +6,7 @@
 #include <lvgl.h>
 
 typedef lv_disp_t lv_display_t;
+typedef void (*esp_lv_adapter_task_cb_t)(void *user_data);
 
 typedef enum {
     ESP_LV_ADAPTER_ROTATE_0 = 0,
@@ -69,6 +70,7 @@ esp_err_t esp_lv_adapter_init(const esp_lv_adapter_config_t *config);
 esp_err_t esp_lv_adapter_start(void);
 esp_err_t esp_lv_adapter_deinit(void);
 esp_err_t esp_lv_adapter_lock(int32_t timeout_ms);
+esp_err_t esp_lv_adapter_post_task(esp_lv_adapter_task_cb_t cb, void *user_data, int32_t timeout_ms);
 void esp_lv_adapter_unlock(void);
 lv_display_t *esp_lv_adapter_register_display(const esp_lv_adapter_display_config_t *config);
 lv_indev_t *esp_lv_adapter_register_touch(const esp_lv_adapter_touch_config_t *config);
